@@ -1,6 +1,5 @@
 use bytes::Bytes;
 use js_sys::Uint8Array;
-use url::Url;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     WebTransport, WebTransportBidirectionalStream, WebTransportCloseInfo, WebTransportSendStream,
@@ -19,11 +18,11 @@ use web_streams::{Reader, Writer};
 #[derive(Clone)]
 pub struct Session {
     inner: WebTransport,
-    url: Url,
+    url: String,
 }
 
 impl Session {
-    pub fn new(inner: WebTransport, url: Url) -> Self {
+    pub fn new(inner: WebTransport, url: String) -> Self {
         Self { inner, url }
     }
 
@@ -119,7 +118,7 @@ impl Session {
     }
 
     /// Return the URL used to create the session.
-    pub fn url(&self) -> &Url {
+    pub fn url(&self) -> &str {
         &self.url
     }
 }

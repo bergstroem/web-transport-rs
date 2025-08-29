@@ -1,5 +1,4 @@
 use js_sys::{Object, Reflect, Uint8Array};
-use url::Url;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{WebTransport, WebTransportOptions};
 
@@ -74,10 +73,10 @@ pub struct Client {
 
 impl Client {
     /// Connect once the builder is configured.
-    pub async fn connect(&self, url: Url) -> Result<Session, Error> {
-        let inner = WebTransport::new_with_options(url.as_str(), &self.options)?;
+    pub async fn connect(&self, url: &str) -> Result<Session, Error> {
+        let inner = WebTransport::new_with_options(url, &self.options)?;
         JsFuture::from(inner.ready()).await?;
 
-        Ok(Session::new(inner, url))
+        Ok(Session::new(inner, url.to_string()))
     }
 }

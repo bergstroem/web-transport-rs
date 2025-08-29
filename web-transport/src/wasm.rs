@@ -53,7 +53,7 @@ pub struct Client {
 }
 
 impl Client {
-    pub async fn connect(&self, url: Url) -> Result<Session, Error> {
+    pub async fn connect(&self, url: &str) -> Result<Session, Error> {
         Ok(self.inner.connect(url).await?.into())
     }
 }
@@ -100,7 +100,7 @@ impl Session {
     }
 
     /// Return the URL used to create the session.
-    pub fn url(&self) -> &Url {
+    pub fn url(&self) -> &str {
         self.0.url()
     }
 }
