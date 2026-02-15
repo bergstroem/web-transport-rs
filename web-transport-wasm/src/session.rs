@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use js_sys::{Reflect, Uint8Array};
+#[cfg(feature = "url")]
 use url::Url;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
@@ -19,12 +20,31 @@ use web_streams::{Reader, Writer};
 #[derive(Clone)]
 pub struct Session {
     inner: WebTransport,
+    #[cfg(feature = "url")]
     url: Url,
+    #[cfg(not(feature = "url"))]
+    url: String,
     protocol: Option<String>,
 }
 
 impl Session {
+    #[cfg(feature = "url")]
     pub fn new(inner: WebTransport, url: Url) -> Self {
+        // TODO use the web_sys bindings when updated.
+        // Until then, we try to access the protocol property on the inner object.
+        let protocol = Reflect::get(&inner, &"protocol".into())
+            .ok()
+            .and_then(|p| p.as_string());
+
+        Self {
+            inner,
+            url,
+            protocol,
+        }
+    }
+
+    #[cfg(not(feature = "url"))]
+    pub fn new(inner: WebTransport, url: String) -> Self {
         // TODO use the web_sys bindings when updated.
         // Until then, we try to access the protocol property on the inner object.
         let protocol = Reflect::get(&inner, &"protocol".into())
@@ -130,7 +150,14 @@ impl Session {
     }
 
     /// Return the URL used to create the session.
+    #[cfg(feature = "url")]
     pub fn url(&self) -> &Url {
+        &self.url
+    }
+
+    /// Return the URL used to create the session.
+    #[cfg(not(feature = "url"))]
+    pub fn url(&self) -> &str {
         &self.url
     }
 

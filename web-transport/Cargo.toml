@@ -12,13 +12,19 @@ keywords = ["quic", "http3", "webtransport"]
 categories = ["network-programming", "web-programming"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = ["url"]
+url = ["dep:url", "web-transport-wasm?/url"]
+
 [dependencies]
 bytes = "1"
 thiserror = "2"
-url = "2"
+url = { version = "2", optional = true }
+web-transport-wasm = { version = "0.5.5", path = "../web-transport-wasm", optional = true, default-features = false }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 web-transport-quinn = { version = "0.11.4", path = "../web-transport-quinn" }
+url = "2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-web-transport-wasm = { version = "0.5.5", path = "../web-transport-wasm" }
+web-transport-wasm = { version = "0.5.5", path = "../web-transport-wasm", default-features = false }

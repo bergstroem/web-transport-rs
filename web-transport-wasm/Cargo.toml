@@ -16,11 +16,15 @@ targets = ["wasm32-unknown-unknown"]
 rustc-args = ["--cfg=web_sys_unstable_apis"]
 rustdoc-args = ["--cfg=web_sys_unstable_apis"]
 
+[features]
+default = ["url"]
+url = ["dep:url"]
+
 [dependencies]
 bytes = "1"
 js-sys = "0.3.85"
 thiserror = "2"
-url = "2"
+url = { version = "2", optional = true }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-streams = "0.1.2"

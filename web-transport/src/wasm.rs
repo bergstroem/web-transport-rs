@@ -1,4 +1,5 @@
 use bytes::{Buf, BufMut, Bytes};
+#[cfg(feature = "url")]
 use url::Url;
 
 pub use web_transport_wasm::CongestionControl;
@@ -48,7 +49,13 @@ pub struct Client {
 }
 
 impl Client {
+    #[cfg(feature = "url")]
     pub async fn connect(&self, url: Url) -> Result<Session, Error> {
+        Ok(self.inner.connect(url).await?.into())
+    }
+
+    #[cfg(not(feature = "url"))]
+    pub async fn connect(&self, url: &str) -> Result<Session, Error> {
         Ok(self.inner.connect(url).await?.into())
     }
 }
@@ -95,7 +102,14 @@ impl Session {
     }
 
     /// Return the URL used to create the session.
+    #[cfg(feature = "url")]
     pub fn url(&self) -> &Url {
+        self.0.url()
+    }
+
+    /// Return the URL used to create the session.
+    #[cfg(not(feature = "url"))]
+    pub fn url(&self) -> &str {
         self.0.url()
     }
 
