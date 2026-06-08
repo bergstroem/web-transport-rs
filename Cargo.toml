@@ -2,6 +2,7 @@
 members = [
     "rs/qmux",
     "rs/web-transport",
+    "rs/web-transport-dquic",
     "rs/web-transport-iroh",
     "rs/web-transport-node",
     "rs/web-transport-noq",
