@@ -46,3 +46,7 @@ web-transport-trait = { workspace = true }
 [dev-dependencies]
 rcgen = "0.13"
 tokio = { version = "1", features = ["full"] }
+# Used by tests/interop.rs to verify cross-stack interop with the quinn backend.
+web-transport-quinn = { path = "../web-transport-quinn", default-features = false, features = [
+    "ring",
+] }

@@ -70,6 +70,12 @@ impl Connecting {
 
         tracing::debug!(?response, "sending CONNECT response");
         response.write(&mut self.send).await?;
+        // dquic buffers stream writes; flush so the response reaches the peer promptly even though
+        // nothing else drives this stream afterwards (the proto helper does not flush).
+        {
+            use tokio::io::AsyncWriteExt;
+            let _ = self.send.flush().await;
+        }
 
         Ok(Connected {
             request: self.request,
