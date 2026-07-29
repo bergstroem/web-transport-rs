@@ -1382,3 +1382,165 @@ describe("Session.accept (server role)", () => {
 		session.close();
 	});
 });
+
+// STREAM frame sizing. What we accept is bounded by the `max_record_size` we
+// advertised (enforced on the record, not on the frame inside it). What we send
+// also keeps the compatibility ceiling required by released receivers.
+describe("STREAM frame size", () => {
+	afterEach(() => {
+		if (ORIGINAL_WSS === undefined) {
+			delete (globalThis as { WebSocketStream?: unknown }).WebSocketStream;
+		} else {
+			(globalThis as { WebSocketStream?: unknown }).WebSocketStream = ORIGINAL_WSS;
+		}
+	});
+
+	/** Read one incoming uni stream to completion. */
+	async function readIncomingUni(session: Session): Promise<Uint8Array> {
+		const incoming = await session.incomingUnidirectionalStreams.getReader().read();
+		if (!incoming.value) throw new Error("expected an incoming stream");
+		const reader = incoming.value.getReader();
+		const chunks: Uint8Array[] = [];
+		while (true) {
+			const { value, done } = await reader.read();
+			if (done) break;
+			chunks.push(value);
+		}
+		const out = new Uint8Array(chunks.reduce((n, c) => n + c.byteLength, 0));
+		let offset = 0;
+		for (const chunk of chunks) {
+			out.set(chunk, offset);
+			offset += chunk.byteLength;
+		}
+		return out;
+	}
+
+	test("a record-sized STREAM frame is delivered", async () => {
+		// A 5-byte STREAM header plus 16377 payload bytes is a record of exactly the
+		// max_record_size we advertised: refusing it refuses the very size the
+		// handshake invited. A peer chunking at any other header budget — an older
+		// release, a third-party stack — lands somewhere in this range too.
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		const id = Stream.Id.create(0n, Stream.Dir.Uni, true);
+		const data = new Uint8Array(Number(DEFAULT_MAX_RECORD_SIZE) - 5).fill(0x5a);
+		const frame: Frame.Data = { type: "stream", id, offset: 0n, data, fin: true };
+		expect(Frame.encode(frame, "qmux-01").byteLength).toBe(Number(DEFAULT_MAX_RECORD_SIZE));
+		peer.send(frame);
+
+		expect(await readIncomingUni(session)).toEqual(data);
+		session.close();
+	});
+
+	test("qmux-00 delivers a frame of exactly max_frame_size", async () => {
+		// draft-00 §5.2 bounds the whole frame, header included, so a 16384-byte
+		// frame is legal — and the parameter may only ever be raised.
+		const { session, peer } = accept({ protocol: "qmux-00" });
+		await session.ready;
+
+		const id = Stream.Id.create(0n, Stream.Dir.Uni, false);
+		const data = new Uint8Array(Frame.MAX_FRAME_SIZE - 5).fill(0x5a);
+		const frame = Frame.encode({ type: "stream", id, offset: 0n, data, fin: true }, "qmux-00");
+		expect(frame.byteLength).toBe(Frame.MAX_FRAME_SIZE);
+		peer.sendRaw(frame);
+
+		expect(await readIncomingUni(session)).toEqual(data);
+		session.close();
+	});
+
+	test("a qmux-00 frame over max_frame_size closes the session", async () => {
+		// One byte past the limit is a frame-size violation, which draft-00 §5.2
+		// requires closing the connection over.
+		const { session, peer } = accept({ protocol: "qmux-00" });
+		await session.ready;
+
+		const id = Stream.Id.create(0n, Stream.Dir.Uni, false);
+		const data = new Uint8Array(Frame.MAX_FRAME_SIZE - 4).fill(0x5a);
+		const frame = Frame.encode({ type: "stream", id, offset: 0n, data, fin: true }, "qmux-00");
+		expect(frame.byteLength).toBe(Frame.MAX_FRAME_SIZE + 1);
+		peer.sendRaw(frame);
+
+		const err = await expectSessionFailure(session);
+		expect((err.cause as Error).message).toContain("max_frame_size");
+		await waitFor(() => sentCloseCode(peer) !== undefined);
+		expect(sentCloseCode(peer)).toBe(1002);
+	});
+
+	test("the legacy binding delivers a full-size frame", async () => {
+		// No record layer here, so the message is the frame; these bytes are
+		// unchanged across every release of this package.
+		const { session, peer } = accept({ protocol: "webtransport" });
+		await session.ready;
+
+		const id = Stream.Id.create(0n, Stream.Dir.Uni, false);
+		const data = new Uint8Array(Frame.MAX_FRAME_SIZE - 2).fill(0x5a);
+		peer.sendRaw(Frame.encode({ type: "stream", id, data, fin: true }, "webtransport"));
+
+		expect(await readIncomingUni(session)).toEqual(data);
+		session.close();
+	});
+
+	test("a record over max_record_size closes the session", async () => {
+		// The record is the limit a peer can actually derive from the handshake, so
+		// it is the one worth enforcing — and a record too large to parse is a
+		// connection-level violation.
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		peer.sendRaw(new Uint8Array(Number(DEFAULT_MAX_RECORD_SIZE) + 1));
+
+		const err = await expectSessionFailure(session);
+		expect((err.cause as Error).message).toContain("max_record_size");
+		await waitFor(() => sentCloseCode(peer) !== undefined);
+		expect(sentCloseCode(peer)).toBe(1002);
+	});
+
+	test("we keep STREAM payloads within the released-receiver ceiling", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		const writable = await session.createUnidirectionalStream();
+		await writable.getWriter().write(new Uint8Array(Number(DEFAULT_MAX_RECORD_SIZE) * 2).fill(0x5a));
+
+		await waitFor(() => peer.has("stream"));
+		const stream = peer.received().find((f) => f.type === "stream") as Frame.Data;
+		expect(stream.data.byteLength).toBe(Frame.MAX_FRAME_PAYLOAD);
+		session.close();
+	});
+
+	test("a peer advertising the largest max_record_size can still be written to", async () => {
+		// max_record_size is a varint, so 2^62-1 is legal — and is not a value
+		// `number` holds exactly, so the budget has to stay a bigint.
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams({ maxRecordSize: VarInt.MAX }) });
+
+		const writable = await session.createUnidirectionalStream();
+		const data = new Uint8Array(1024).fill(0x5a);
+		await writable.getWriter().write(data);
+
+		await waitFor(() => peer.has("stream"));
+		const stream = peer.received().find((f) => f.type === "stream") as Frame.Data;
+		expect(stream.data).toEqual(data);
+		session.close();
+	});
+
+	test("a larger peer record limit does not bypass the compatibility ceiling", async () => {
+		const maxRecordSize = 32_768n;
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams({ maxRecordSize }) });
+
+		const writable = await session.createUnidirectionalStream();
+		await writable.getWriter().write(new Uint8Array(Number(maxRecordSize) * 2).fill(0x5a));
+
+		await waitFor(() => peer.has("stream"));
+		const stream = peer.received().find((f) => f.type === "stream") as Frame.Data;
+		expect(stream.data.byteLength).toBe(Frame.MAX_FRAME_PAYLOAD);
+		session.close();
+	});
+});

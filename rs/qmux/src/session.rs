@@ -11,8 +11,9 @@ use crate::credit::Credit;
 use crate::sched::PriorityQueue;
 use crate::transport::{Reader, Transport, Writer};
 use crate::{
-    proto::varint_size, ApplicationClose, ConnectionClose, Error, Frame, ResetStream, StopSending,
-    Stream, StreamDir, StreamId, TransportParams, Version, MAX_FRAME_PAYLOAD,
+    proto::{max_stream_payload, varint_size},
+    ApplicationClose, ConnectionClose, Error, Frame, ResetStream, StopSending, Stream, StreamDir,
+    StreamId, TransportParams, Version, MAX_FRAME_PAYLOAD, MAX_FRAME_SIZE,
 };
 use bytes::{Buf, BufMut, Bytes};
 use tokio::sync::{mpsc, watch};
@@ -127,6 +128,11 @@ pub struct Session {
     // Resolved from the peer's transport parameters before the session is handed
     // to the caller (0 = the peer doesn't accept datagrams).
     datagram_max_size: Arc<AtomicUsize>,
+
+    // The peer's `max_record_size`, shared with the reader and writer tasks and
+    // handed to every `SendStream` we open so it can size its frames. Seeded with
+    // the draft-01 default until the peer's parameters arrive.
+    record_limit: Arc<AtomicU64>,
 
     // Closes the connection when the last `Session` clone drops. Never read.
     _guard: Arc<SessionGuard>,
@@ -618,6 +624,10 @@ mod writer_final_size_tests {
         let conn_credit = Credit::new(3);
         let mut send = SendStream {
             id,
+            version: crate::Version::QMux01,
+            record_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::proto::DEFAULT_MAX_RECORD_SIZE,
+            )),
             outbound,
             outbound_priority: priority,
             inbound_stopped: stopped_rx,
@@ -880,8 +890,18 @@ impl<R: Reader> SessionState<R> {
                         for frame in Frame::decode_record(data)? {
                             self.recv_frame(frame).await?;
                         }
-                    } else if let Some(frame) = Frame::decode(data, self.config.version)? {
-                        self.recv_frame(frame).await?;
+                    } else {
+                        // draft-00 §5.2: `max_frame_size` bounds the whole frame,
+                        // header included, and may only be raised from its initial
+                        // value — which we never do, so the initial value is what a
+                        // peer may send. Each message is one frame here. The legacy
+                        // binding predates the parameter and bounds nothing.
+                        if self.config.version == Version::QMux00 && data.len() > MAX_FRAME_SIZE {
+                            return Err(Error::FrameTooLarge);
+                        }
+                        if let Some(frame) = Frame::decode(data, self.config.version)? {
+                            self.recv_frame(frame).await?;
+                        }
                     }
                 }
                 _ = async { closed.wait_for(|err| err.is_some()).await.ok(); } => {
@@ -916,10 +936,6 @@ impl<R: Reader> SessionState<R> {
                 self.recv_transport_parameters(params)?;
             }
             Frame::Stream(stream) => {
-                if stream.data.len() > MAX_FRAME_PAYLOAD {
-                    return Err(Error::FrameTooLarge);
-                }
-
                 if !stream.id.can_recv(self.is_server) {
                     return Err(Error::InvalidStreamId);
                 }
@@ -1077,6 +1093,8 @@ impl<R: Reader> SessionState<R> {
 
                         let send_frontend = SendStream {
                             id: stream.id,
+                            version: self.config.version,
+                            record_limit: self.record_limit.clone(),
                             outbound: self.outbound.clone(),
                             outbound_priority: self.control.clone(),
                             inbound_stopped: rx,
@@ -1775,6 +1793,7 @@ impl Session {
             conn_recv_credit,
             recv_datagram: Arc::new(tokio::sync::Mutex::new(recv_datagram_rx)),
             datagram_max_size,
+            record_limit,
             outbound_datagram: outbound_datagram_tx,
             _guard: guard,
         }
@@ -1825,6 +1844,8 @@ impl generic::Session for Session {
         };
         let send_frontend = SendStream {
             id,
+            version: self.config.version,
+            record_limit: self.record_limit.clone(),
             outbound: self.outbound.clone(),
             outbound_priority: self.outbound_priority.clone(),
             inbound_stopped: rx,
@@ -1880,6 +1901,8 @@ impl generic::Session for Session {
         };
         let send_frontend = SendStream {
             id,
+            version: self.config.version,
+            record_limit: self.record_limit.clone(),
             outbound: self.outbound.clone(),
             outbound_priority: self.outbound_priority.clone(),
             inbound_stopped: rx,
@@ -2031,6 +2054,12 @@ struct SendState {
 /// The send half of a multiplexed stream.
 pub struct SendStream {
     id: StreamId,
+    version: Version,
+
+    /// The peer's `max_record_size`, shared with the writer task: seeded with the
+    /// draft-01 default and raised once the peer's transport parameters arrive.
+    /// Unused on the wire formats that have no record layer.
+    record_limit: Arc<AtomicU64>,
 
     outbound: PriorityQueue,                         // STREAM
     outbound_priority: mpsc::UnboundedSender<Frame>, // RESET_STREAM
@@ -2049,6 +2078,20 @@ pub struct SendStream {
 }
 
 impl SendStream {
+    /// The largest STREAM frame the peer accepts, in bytes.
+    ///
+    /// Record-framed drafts negotiate it: a frame rides in one record, so the
+    /// peer's `max_record_size` is the limit. draft-00 and the legacy binding have
+    /// no record layer and negotiate nothing, so draft-00's whole-frame
+    /// `max_frame_size` stands in.
+    fn frame_budget(&self) -> u64 {
+        if self.version.uses_records() {
+            self.record_limit.load(Ordering::Acquire)
+        } else {
+            MAX_FRAME_SIZE as u64
+        }
+    }
+
     fn recv_stop(&mut self, code: VarInt) -> Error {
         if let Some(error) = &self.closed {
             return error.clone();
@@ -2169,7 +2212,17 @@ impl generic::SendStream for SendStream {
         let mut total = 0;
 
         while buf.has_remaining() {
-            let chunk_len = buf.chunk().len().min(MAX_FRAME_PAYLOAD) as u64;
+            // Size from the peer's frame budget and this frame's actual header,
+            // then apply the compatibility ceiling for released receivers.
+            let max_payload =
+                max_stream_payload(self.version, self.frame_budget(), self.id, self.offset)
+                    .min(MAX_FRAME_PAYLOAD as u64);
+            if max_payload == 0 {
+                // Unreachable with a conforming peer: max_record_size is validated
+                // against the draft-01 minimum on arrival. Fail rather than loop.
+                return Err(Error::FrameTooLarge);
+            }
+            let chunk_len = (buf.chunk().len() as u64).min(max_payload);
 
             // Wait for queue capacity and flow-control credit *before* taking any
             // bytes out of `buf`. Callers race this future against other work (moq
@@ -2707,6 +2760,10 @@ mod send_offset_tests {
         let (_stop_tx, stop_rx) = mpsc::unbounded_channel();
         let mut send = SendStream {
             id,
+            version: crate::Version::QMux01,
+            record_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::proto::DEFAULT_MAX_RECORD_SIZE,
+            )),
             outbound: outbound.clone(),
             outbound_priority: control,
             inbound_stopped: stop_rx,
@@ -2767,6 +2824,10 @@ mod write_cancel_tests {
         let (_stop_tx, stop_rx) = mpsc::unbounded_channel();
         SendStream {
             id: StreamId::new(0, StreamDir::Uni, false),
+            version: crate::Version::QMux01,
+            record_limit: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::proto::DEFAULT_MAX_RECORD_SIZE,
+            )),
             outbound,
             outbound_priority: control,
             inbound_stopped: stop_rx,
@@ -3234,6 +3295,268 @@ mod recv_open_tests {
             .expect("connection closed after legacy reset")
             .expect("accept_uni failed");
         assert_eq!(next.read_all().await.unwrap().as_ref(), b"ok");
+    }
+}
+
+// STREAM frame sizing. What we accept is bounded by the `max_record_size` we
+// advertised (enforced on the record, not on the frame inside it). What we send
+// also keeps the compatibility ceiling required by released receivers.
+#[cfg(test)]
+mod stream_payload_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use tokio::sync::mpsc;
+    use web_transport_trait::{RecvStream as _, SendStream as _, Session as _};
+
+    use super::{Reader, Session, Transport, Writer};
+    use crate::proto::{Frame, Stream, DEFAULT_MAX_RECORD_SIZE};
+    use crate::{Config, Error, StreamDir, StreamId, Version, MAX_FRAME_PAYLOAD};
+
+    /// A scripted transport that also keeps every record the session wrote, so a
+    /// test can measure the frames it emitted.
+    struct ScriptedTransport {
+        incoming: mpsc::UnboundedReceiver<Bytes>,
+        outgoing: Arc<Mutex<Vec<Bytes>>>,
+    }
+
+    struct ScriptedWriter {
+        outgoing: Arc<Mutex<Vec<Bytes>>>,
+    }
+
+    struct ScriptedReader {
+        incoming: mpsc::UnboundedReceiver<Bytes>,
+    }
+
+    impl Transport for ScriptedTransport {
+        type Writer = ScriptedWriter;
+        type Reader = ScriptedReader;
+
+        fn split(self) -> (ScriptedWriter, ScriptedReader) {
+            (
+                ScriptedWriter {
+                    outgoing: self.outgoing,
+                },
+                ScriptedReader {
+                    incoming: self.incoming,
+                },
+            )
+        }
+    }
+
+    impl Writer for ScriptedWriter {
+        async fn send(&mut self, data: Bytes) -> Result<(), Error> {
+            self.outgoing.lock().unwrap().push(data);
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    impl Reader for ScriptedReader {
+        async fn recv(&mut self) -> Result<Bytes, Error> {
+            match self.incoming.recv().await {
+                Some(bytes) => Ok(bytes),
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    struct Peer {
+        inbound: mpsc::UnboundedSender<Bytes>,
+        outbound: Arc<Mutex<Vec<Bytes>>>,
+    }
+
+    impl Peer {
+        /// Announce the peer's transport parameters, which is what publishes its
+        /// `max_record_size` (and the credit our sends need).
+        fn params(&self, max_record_size: u64) {
+            let mut params = Config::new(Version::QMux01).to_transport_params();
+            params.max_record_size = max_record_size;
+            self.inbound
+                .send(
+                    Frame::TransportParameters(params)
+                        .encode(Version::QMux01)
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+
+        /// Every record carrying a STREAM frame, in send order.
+        fn stream_records(&self) -> Vec<Bytes> {
+            self.outbound
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|record| {
+                    Frame::decode_record((*record).clone())
+                        .map(|frames| frames.iter().any(|f| matches!(f, Frame::Stream(_))))
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect()
+        }
+    }
+
+    /// A client session fed by a scripted peer.
+    fn scripted_session(version: Version) -> (Session, Peer) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let outbound = Arc::new(Mutex::new(Vec::new()));
+        let session = Session::new(
+            ScriptedTransport {
+                incoming: rx,
+                outgoing: outbound.clone(),
+            },
+            false,
+            Config::new(version),
+        );
+        (
+            session,
+            Peer {
+                inbound: tx,
+                outbound,
+            },
+        )
+    }
+
+    /// A STREAM frame on a server-initiated uni stream (peer-initiated, since the
+    /// session under test is the client).
+    fn uni_stream(version: Version, index: u64, data: Vec<u8>, fin: bool) -> Bytes {
+        Frame::Stream(Stream {
+            id: StreamId::new(index, StreamDir::Uni, true),
+            offset: 0,
+            data: Bytes::from(data),
+            fin,
+        })
+        .encode(version)
+        .unwrap()
+    }
+
+    async fn read_uni(session: &Session) -> Vec<u8> {
+        let mut recv = tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+            .await
+            .expect("accept_uni timed out")
+            .expect("accept_uni failed");
+        recv.read_all().await.unwrap().to_vec()
+    }
+
+    /// Wait for the session to write `count` records carrying stream data.
+    async fn wait_for_stream_records(peer: &Peer, count: usize) -> Vec<Bytes> {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let records = peer.stream_records();
+                if records.len() >= count {
+                    return records;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the session did not write the expected stream records")
+    }
+
+    fn stream_payload_len(record: &Bytes) -> usize {
+        Frame::decode_record(record.clone())
+            .unwrap()
+            .into_iter()
+            .find_map(|frame| match frame {
+                Frame::Stream(stream) => Some(stream.data.len()),
+                _ => None,
+            })
+            .expect("record did not contain a STREAM frame")
+    }
+
+    /// A record of exactly the `max_record_size` we advertised: a 5-byte STREAM
+    /// header plus 16377 payload bytes. Refusing this refuses the very size the
+    /// handshake invited — and a peer chunking at any other header budget (an
+    /// older release, a third-party stack) lands in this range too.
+    #[tokio::test]
+    async fn record_sized_stream_frame_is_delivered() {
+        let (session, peer) = scripted_session(Version::QMux01);
+
+        let payload = vec![0x5a; DEFAULT_MAX_RECORD_SIZE as usize - 5];
+        let frame = uni_stream(Version::QMux01, 0, payload.clone(), true);
+        assert_eq!(frame.len(), DEFAULT_MAX_RECORD_SIZE as usize);
+        peer.inbound.send(frame).unwrap();
+
+        assert_eq!(read_uni(&session).await, payload);
+    }
+
+    /// draft-00 §5.2 bounds the whole frame at `max_frame_size`, so a frame of
+    /// exactly that size — header included — is legal and must be delivered.
+    #[tokio::test]
+    async fn qmux00_max_size_frame_is_delivered() {
+        let (session, peer) = scripted_session(Version::QMux00);
+
+        let payload = vec![0x5a; crate::MAX_FRAME_SIZE - 5];
+        let frame = uni_stream(Version::QMux00, 0, payload.clone(), true);
+        assert_eq!(frame.len(), crate::MAX_FRAME_SIZE);
+        peer.inbound.send(frame).unwrap();
+
+        assert_eq!(read_uni(&session).await, payload);
+    }
+
+    /// One byte past it is a frame-size violation, which draft-00 §5.2 requires
+    /// closing the connection over.
+    #[tokio::test]
+    async fn qmux00_oversized_frame_closes_the_session() {
+        let (session, peer) = scripted_session(Version::QMux00);
+
+        let frame = uni_stream(
+            Version::QMux00,
+            0,
+            vec![0x5a; crate::MAX_FRAME_SIZE - 4],
+            true,
+        );
+        assert_eq!(frame.len(), crate::MAX_FRAME_SIZE + 1);
+        peer.inbound.send(frame).unwrap();
+
+        let err = tokio::time::timeout(Duration::from_secs(1), session.closed())
+            .await
+            .expect("the session stayed open on an oversized frame");
+        assert!(matches!(err, Error::FrameTooLarge), "got {err:?}");
+    }
+
+    /// Released receivers enforce the historical payload ceiling even though the
+    /// record they advertise can hold a slightly larger STREAM frame.
+    #[tokio::test]
+    async fn stream_payloads_stay_within_the_released_receiver_ceiling() {
+        let (session, peer) = scripted_session(Version::QMux01);
+        peer.params(DEFAULT_MAX_RECORD_SIZE);
+
+        let mut send = tokio::time::timeout(Duration::from_secs(1), session.open_uni())
+            .await
+            .expect("open_uni timed out")
+            .expect("open_uni failed");
+        send.write(&vec![0x5a; DEFAULT_MAX_RECORD_SIZE as usize * 2])
+            .await
+            .unwrap();
+
+        let records = wait_for_stream_records(&peer, 1).await;
+        assert_eq!(stream_payload_len(&records[0]), MAX_FRAME_PAYLOAD);
+    }
+
+    /// A larger peer record limit does not bypass the compatibility ceiling.
+    #[tokio::test]
+    async fn larger_record_limit_keeps_the_compatibility_ceiling() {
+        const MAX_RECORD_SIZE: u64 = 32_768;
+
+        let (session, peer) = scripted_session(Version::QMux01);
+        peer.params(MAX_RECORD_SIZE);
+
+        let mut send = tokio::time::timeout(Duration::from_secs(1), session.open_uni())
+            .await
+            .expect("open_uni timed out")
+            .expect("open_uni failed");
+        send.write(&vec![0x5a; MAX_RECORD_SIZE as usize * 2])
+            .await
+            .unwrap();
+
+        let records = wait_for_stream_records(&peer, 1).await;
+        assert_eq!(stream_payload_len(&records[0]), MAX_FRAME_PAYLOAD);
     }
 }
 
