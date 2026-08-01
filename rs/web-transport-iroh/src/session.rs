@@ -1,6 +1,6 @@
 use std::{
     fmt,
-    future::{Future, poll_fn},
+    future::Future,
     io::Cursor,
     ops::Deref,
     pin::Pin,
@@ -10,6 +10,7 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use iroh::endpoint::{self, Connection, PathStats};
+use kio::Waiter;
 use n0_future::{
     FuturesUnordered,
     stream::{Stream, StreamExt},
@@ -18,6 +19,7 @@ use web_transport_proto::{ConnectRequest, ConnectResponse, Frame, StreamUni, Var
 
 use crate::{
     ClientError, Connected, RecvStream, SendStream, SessionError, Settings, WebTransportError,
+    waiters::AcceptWaiters,
 };
 
 /// An established WebTransport session, acting like a full QUIC connection. See [`iroh::endpoint::Connection`].
@@ -99,7 +101,9 @@ impl Session {
     /// Accept a new unidirectional stream. See [`iroh::endpoint::Connection::accept_uni`].
     pub async fn accept_uni(&self) -> Result<RecvStream, SessionError> {
         if let Some(h3) = &self.h3 {
-            poll_fn(|cx| h3.accept.lock().unwrap().poll_accept_uni(cx)).await
+            // `kio::wait` owns the waiter, so dropping this future — a `timeout` that
+            // expires, say — also drops its registration in `H3SessionAccept`.
+            kio::wait(|waiter| poll_accept_uni_shared(&h3.accept, waiter)).await
         } else {
             self.conn
                 .accept_uni()
@@ -112,7 +116,7 @@ impl Session {
     /// Accept a new bidirectional stream. See [`iroh::endpoint::Connection::accept_bi`].
     pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), SessionError> {
         if let Some(h3) = &self.h3 {
-            poll_fn(|cx| h3.accept.lock().unwrap().poll_accept_bi(cx)).await
+            kio::wait(|waiter| poll_accept_bi_shared(&h3.accept, waiter)).await
         } else {
             self.conn
                 .accept_bi()
@@ -347,6 +351,61 @@ type PendingUni =
 type PendingBi = dyn Future<Output = Result<Option<(endpoint::SendStream, endpoint::RecvStream)>, SessionError>>
     + Send;
 
+// Poll the shared accept state, then wake the *other* accepters once the lock is
+// released.
+//
+// `H3SessionAccept` does not wake them itself: a waker is free to resume its task
+// inline, and the first thing a resumed accepter does is take this same lock. An
+// arrival or a failure is exactly what the others are parked waiting to retry
+// after, so `Ready` is the signal.
+fn poll_accept_uni_shared(
+    accept: &Mutex<H3SessionAccept>,
+    waiter: &Waiter,
+) -> Poll<Result<RecvStream, SessionError>> {
+    let (result, waiters) = {
+        let mut accept = accept.lock().unwrap();
+        let waiters = accept.uni_waiters.clone();
+
+        // The poll below drives the shared accept futures with this list's waker, and
+        // one of them may wake it inline. Hold those back until the lock is gone.
+        waiters.arm();
+        let result = accept.poll_accept_uni(waiter);
+
+        (result, waiters)
+    };
+
+    // `disarm` runs first either way: the count has to come down even on a `Ready`.
+    if waiters.disarm() || result.is_ready() {
+        waiters.wake_all();
+    }
+
+    result
+}
+
+fn poll_accept_bi_shared(
+    accept: &Mutex<H3SessionAccept>,
+    waiter: &Waiter,
+) -> Poll<Result<(SendStream, RecvStream), SessionError>> {
+    let (result, waiters) = {
+        let mut accept = accept.lock().unwrap();
+        let waiters = accept.bi_waiters.clone();
+
+        // The poll below drives the shared accept futures with this list's waker, and
+        // one of them may wake it inline. Hold those back until the lock is gone.
+        waiters.arm();
+        let result = accept.poll_accept_bi(waiter);
+
+        (result, waiters)
+    };
+
+    // `disarm` runs first either way: the count has to come down even on a `Ready`.
+    if waiters.disarm() || result.is_ready() {
+        waiters.wake_all();
+    }
+
+    result
+}
+
 // Logic just for accepting streams, which is annoying because of the stream header.
 struct H3SessionAccept {
     session_id: VarInt,
@@ -363,13 +422,19 @@ struct H3SessionAccept {
     pending_uni: FuturesUnordered<Pin<Box<PendingUni>>>,
     pending_bi: FuturesUnordered<Pin<Box<PendingBi>>>,
 
-    // Wakers from concurrent callers of accept_bi / accept_uni.
-    // When one caller gets a stream, all others are woken so they can retry.
-    // Every clone polls this one struct, which would otherwise keep only the most
-    // recent waker, so a second accepter would register through a waker the first
-    // had already replaced and never wake.
-    bi_wakers: Vec<Waker>,
-    uni_wakers: Vec<Waker>,
+    // Waiters from concurrent callers of accept_bi / accept_uni.
+    // Every clone of the session polls this one struct, so an arrival has to be fanned
+    // out: each caller registers here and all of them are woken when a stream lands —
+    // by the caller that saw it, once it has released the lock on this struct.
+    bi_waiters: Arc<AcceptWaiters>,
+    uni_waiters: Arc<AcceptWaiters>,
+
+    // `Waker::from(waiters.clone())`, cached so the inner accept futures are polled with
+    // the same waker every time. That waker outlives every caller, so an accepter that
+    // drops its future cannot take the wakeup path with it, and the layer below holds
+    // one registration rather than one per caller.
+    bi_waker: Waker,
+    uni_waker: Waker,
 }
 
 impl H3SessionAccept {
@@ -383,6 +448,11 @@ impl H3SessionAccept {
             Some((conn.accept_bi().await, conn))
         }));
 
+        let bi_waiters = Arc::new(AcceptWaiters::default());
+        let uni_waiters = Arc::new(AcceptWaiters::default());
+        let bi_waker = Waker::from(bi_waiters.clone());
+        let uni_waker = Waker::from(uni_waiters.clone());
+
         Self {
             session_id,
 
@@ -395,18 +465,36 @@ impl H3SessionAccept {
             pending_uni: FuturesUnordered::new(),
             pending_bi: FuturesUnordered::new(),
 
-            bi_wakers: Vec::new(),
-            uni_wakers: Vec::new(),
+            bi_waiters,
+            uni_waiters,
+            bi_waker,
+            uni_waker,
         }
     }
 
-    // This is poll-based because we accept and decode streams in parallel.
-    // In async land I would use tokio::JoinSet, but that requires a runtime.
-    // It's better to use FuturesUnordered instead because it's agnostic.
-    pub fn poll_accept_uni(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<RecvStream, SessionError>> {
+    /// Poll for the next unidirectional WebTransport stream.
+    ///
+    /// `waiter` is parked until a stream arrives, the accept fails, or the caller drops
+    /// it. The registration is weak and owned by the caller: keep the [`Waiter`] alive
+    /// until it is woken, or it will be reclaimed and nothing will wake you. Drive this
+    /// with [`kio::wait`], which holds the waiter inside the future it builds.
+    ///
+    /// A `Ready` here means every *other* parked accepter should be woken so it can
+    /// retry. This does not do that itself — see `poll_accept_uni_shared`, which wakes
+    /// them once the lock on this struct is released.
+    //
+    // Poll-based because we accept and decode streams in parallel. In async land this
+    // would be a `tokio::JoinSet`, but that needs a runtime; `FuturesUnordered` is
+    // runtime-agnostic.
+    pub fn poll_accept_uni(&mut self, waiter: &Waiter) -> Poll<Result<RecvStream, SessionError>> {
+        // Register before polling, not on the way out: the shared waker can fire from the
+        // layer below at any point here, and a wake that lands before the caller is on
+        // the list would be lost.
+        self.uni_waiters.register(waiter);
+
+        let waker = self.uni_waker.clone();
+        let cx = &mut Context::from_waker(&waker);
+
         loop {
             // Accept any new streams.
             if let Poll::Ready(Some(res)) = self.accept_uni.poll_next(cx) {
@@ -414,9 +502,6 @@ impl H3SessionAccept {
                 let recv = match res {
                     Ok(recv) => recv,
                     Err(e) => {
-                        for waker in self.uni_wakers.drain(..) {
-                            waker.wake();
-                        }
                         return Poll::Ready(Err(e.into()));
                     }
                 };
@@ -434,21 +519,13 @@ impl H3SessionAccept {
                     tracing::warn!("failed to decode unidirectional stream: {err:?}");
                     continue;
                 }
-                Poll::Ready(None) | Poll::Pending => {
-                    if !self.uni_wakers.iter().any(|w| w.will_wake(cx.waker())) {
-                        self.uni_wakers.push(cx.waker().clone());
-                    }
-                    return Poll::Pending;
-                }
+                Poll::Ready(None) | Poll::Pending => return Poll::Pending,
             };
 
             // Decide if we keep looping based on the type.
             match typ {
                 StreamUni::WEBTRANSPORT => {
                     let recv = RecvStream::new(recv);
-                    for waker in self.uni_wakers.drain(..) {
-                        waker.wake();
-                    }
                     return Poll::Ready(Ok(recv));
                 }
                 StreamUni::QPACK_DECODER => {
@@ -490,10 +567,21 @@ impl H3SessionAccept {
         Ok((typ, recv))
     }
 
+    /// Poll for the next bidirectional WebTransport stream.
+    ///
+    /// The same contract as [`poll_accept_uni`](Self::poll_accept_uni): the `waiter`
+    /// registration is weak and owned by the caller, and a `Ready` is what the other
+    /// parked accepters need to be woken for.
     pub fn poll_accept_bi(
         &mut self,
-        cx: &mut Context<'_>,
+        waiter: &Waiter,
     ) -> Poll<Result<(SendStream, RecvStream), SessionError>> {
+        // Register before polling; see `poll_accept_uni`.
+        self.bi_waiters.register(waiter);
+
+        let waker = self.bi_waker.clone();
+        let cx = &mut Context::from_waker(&waker);
+
         loop {
             // Accept any new streams.
             if let Poll::Ready(Some(res)) = self.accept_bi.poll_next(cx) {
@@ -501,9 +589,6 @@ impl H3SessionAccept {
                 let (send, recv) = match res {
                     Ok(pair) => pair,
                     Err(e) => {
-                        for waker in self.bi_wakers.drain(..) {
-                            waker.wake();
-                        }
                         return Poll::Ready(Err(e.into()));
                     }
                 };
@@ -521,21 +606,13 @@ impl H3SessionAccept {
                     tracing::warn!("failed to decode bidirectional stream: {err:?}");
                     continue;
                 }
-                Poll::Ready(None) | Poll::Pending => {
-                    if !self.bi_wakers.iter().any(|w| w.will_wake(cx.waker())) {
-                        self.bi_wakers.push(cx.waker().clone());
-                    }
-                    return Poll::Pending;
-                }
+                Poll::Ready(None) | Poll::Pending => return Poll::Pending,
             };
 
             if let Some((send, recv)) = res {
                 // Wrap the streams in our own types for correct error codes.
                 let send = SendStream::new(send);
                 let recv = RecvStream::new(recv);
-                for waker in self.bi_wakers.drain(..) {
-                    waker.wake();
-                }
                 return Poll::Ready(Ok((send, recv)));
             }
 
