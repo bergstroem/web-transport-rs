@@ -38,10 +38,14 @@ pub struct Session {
 }
 
 impl Session {
-    /// Create a new session from a raw QUIC connection and a URL.
+    /// Create a new session from a raw QUIC connection.
     ///
-    /// This is used to pretend like a QUIC connection is a WebTransport session.
-    /// It's a hack, but it makes it much easier to support WebTransport and raw QUIC simultaneously.
+    /// This is used to pretend like a QUIC connection is a WebTransport session,
+    /// making it easier to support WebTransport and raw QUIC simultaneously.
+    ///
+    /// There is no HTTP/3 exchange, so [`Self::request`] and [`Self::response`] both
+    /// return `None`. [`Self::protocol`] reports the ALPN negotiated by the QUIC
+    /// handshake instead.
     pub fn raw(conn: Connection) -> Self {
         Self { conn, h3: None }
     }
@@ -96,6 +100,18 @@ impl Session {
     /// Returns the [`ConnectResponse`] if this session was established over HTTP/3.
     pub fn response(&self) -> Option<&ConnectResponse> {
         self.h3.as_ref().map(|s| &s.response)
+    }
+
+    /// Returns the application protocol negotiated for this session.
+    ///
+    /// For an HTTP/3 session this is the subprotocol the server selected via
+    /// `WT-Protocol`; for a raw QUIC session it is the negotiated ALPN.
+    /// Returns `None` if neither was negotiated or the ALPN is not valid UTF-8.
+    pub fn protocol(&self) -> Option<&str> {
+        match self.h3.as_ref() {
+            None => std::str::from_utf8(self.conn.alpn()).ok(),
+            Some(h3) => h3.response.protocol.as_deref(),
+        }
     }
 
     /// Accept a new unidirectional stream. See [`iroh::endpoint::Connection::accept_uni`].
@@ -688,10 +704,7 @@ impl web_transport_trait::Session for Session {
     }
 
     fn protocol(&self) -> Option<&str> {
-        match self.h3.as_ref() {
-            None => std::str::from_utf8(self.conn.alpn()).ok(),
-            Some(h3) => h3.response.protocol.as_deref(),
-        }
+        Self::protocol(self)
     }
 
     fn stats(&self) -> impl web_transport_trait::Stats {
