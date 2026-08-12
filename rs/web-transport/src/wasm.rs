@@ -148,7 +148,7 @@ impl SendStream {
 
     /// Send a QUIC reset code.
     pub fn reset(&mut self, code: u32) {
-        self.0.reset(&code.to_string())
+        self.0.reset(code)
     }
 
     /// Mark the stream as finished.
@@ -160,7 +160,7 @@ impl SendStream {
     }
 
     /// Block until the stream has been closed and return the error code, if any.
-    pub async fn closed(&mut self) -> Result<Option<u8>, Error> {
+    pub async fn closed(&mut self) -> Result<Option<u32>, Error> {
         self.0.closed().await
     }
 }
@@ -180,11 +180,11 @@ impl RecvStream {
 
     /// Send a `STOP_SENDING` QUIC code.
     pub fn stop(&mut self, code: u32) {
-        self.0.stop(&code.to_string())
+        self.0.stop(code)
     }
 
     /// Block until the stream has been closed and return the error code, if any.
-    pub async fn closed(&mut self) -> Result<Option<u8>, Error> {
+    pub async fn closed(&mut self) -> Result<Option<u32>, Error> {
         self.0.closed().await
     }
 }
