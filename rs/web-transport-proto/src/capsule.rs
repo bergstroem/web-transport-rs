@@ -8,6 +8,16 @@ use crate::{Frame, VarInt, VarIntUnexpectedEnd, MAX_FRAME_SIZE};
 // CloseWebTransportSession capsule type (draft-ietf-webtrans-http3-06).
 const CLOSE_WEBTRANSPORT_SESSION_TYPE: u64 = 0x2843;
 
+// Proxygen's legacy WebTransport implementation uses a proprietary capsule
+// type and encodes the application error code as a QUIC variable-length integer.
+const PROXYGEN_CLOSE_WEBTRANSPORT_SESSION_TYPE: u64 = 0x190b4d45;
+
+#[derive(Clone, Copy)]
+enum CloseCodeEncoding {
+    U32,
+    VarInt,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Capsule {
     CloseWebTransportSession { code: u32, reason: String },
@@ -41,27 +51,10 @@ impl Capsule {
 
         match typ_val {
             CLOSE_WEBTRANSPORT_SESSION_TYPE => {
-                if payload.remaining() < 4 {
-                    return Err(CapsuleError::UnexpectedEnd);
-                }
-
-                let error_code = payload.get_u32();
-
-                let message_len = payload.remaining();
-                if message_len > MAX_FRAME_SIZE as usize {
-                    return Err(CapsuleError::MessageTooLong);
-                }
-
-                let mut message_bytes = vec![0u8; message_len];
-                payload.copy_to_slice(&mut message_bytes);
-
-                let error_message =
-                    String::from_utf8(message_bytes).map_err(|_| CapsuleError::InvalidUtf8)?;
-
-                Ok(Self::CloseWebTransportSession {
-                    code: error_code,
-                    reason: error_message,
-                })
+                decode_close_payload(&mut payload, CloseCodeEncoding::U32)
+            }
+            PROXYGEN_CLOSE_WEBTRANSPORT_SESSION_TYPE => {
+                decode_close_payload(&mut payload, CloseCodeEncoding::VarInt)
             }
             _ => {
                 let mut payload_bytes = vec![0u8; payload.remaining()];
@@ -114,18 +107,11 @@ impl Capsule {
         match typ_val {
             CLOSE_WEBTRANSPORT_SESSION_TYPE => {
                 let mut data = buf.as_slice();
-                if data.remaining() < 4 {
-                    return Err(CapsuleError::UnexpectedEnd);
-                }
-
-                let error_code = data.get_u32();
-                let error_message =
-                    String::from_utf8(data.to_vec()).map_err(|_| CapsuleError::InvalidUtf8)?;
-
-                Ok(Some(Self::CloseWebTransportSession {
-                    code: error_code,
-                    reason: error_message,
-                }))
+                decode_close_payload(&mut data, CloseCodeEncoding::U32).map(Some)
+            }
+            PROXYGEN_CLOSE_WEBTRANSPORT_SESSION_TYPE => {
+                let mut data = buf.as_slice();
+                decode_close_payload(&mut data, CloseCodeEncoding::VarInt).map(Some)
             }
             _ => Ok(Some(Self::Unknown {
                 typ,
@@ -189,6 +175,30 @@ impl Capsule {
     }
 }
 
+fn decode_close_payload<B: Buf>(
+    payload: &mut B,
+    code_encoding: CloseCodeEncoding,
+) -> Result<Capsule, CapsuleError> {
+    let code = match code_encoding {
+        CloseCodeEncoding::U32 => {
+            if payload.remaining() < 4 {
+                return Err(CapsuleError::UnexpectedEnd);
+            }
+            payload.get_u32()
+        }
+        CloseCodeEncoding::VarInt => VarInt::decode(payload)?
+            .into_inner()
+            .try_into()
+            .map_err(|_| CapsuleError::InvalidApplicationErrorCode)?,
+    };
+
+    let mut reason = vec![0; payload.remaining()];
+    payload.copy_to_slice(&mut reason);
+    let reason = String::from_utf8(reason).map_err(|_| CapsuleError::InvalidUtf8)?;
+
+    Ok(Capsule::CloseWebTransportSession { code, reason })
+}
+
 // RFC 9297 Section 5.4: Capsule types of the form 0x29 * N + 0x17
 // Returns Some(N) if the value is a grease type, None otherwise
 fn is_grease(val: u64) -> Option<u64> {
@@ -214,6 +224,9 @@ pub enum CapsuleError {
 
     #[error("message too long")]
     MessageTooLong,
+
+    #[error("application error code exceeds 32 bits")]
+    InvalidApplicationErrorCode,
 
     #[error("unknown capsule type: {0:?}")]
     UnknownType(VarInt),
@@ -339,6 +352,28 @@ mod tests {
         }
 
         assert_eq!(buf.len(), 0); // All bytes consumed
+    }
+
+    #[test]
+    fn test_proxygen_close_webtransport_session_decode() {
+        // Proxygen uses its own close capsule type and a QUIC-varint error code.
+        let mut data = Vec::new();
+        VarInt::from_u64(0x190b4d45).unwrap().encode(&mut data);
+        VarInt::from_u32(5).encode(&mut data);
+        VarInt::from_u32(42).encode(&mut data);
+        data.extend_from_slice(b"done");
+
+        let mut buf = data.as_slice();
+        let capsule = Capsule::decode(&mut buf).unwrap();
+
+        assert_eq!(
+            capsule,
+            Capsule::CloseWebTransportSession {
+                code: 42,
+                reason: "done".to_string(),
+            }
+        );
+        assert!(buf.is_empty());
     }
 
     #[test]
@@ -524,6 +559,24 @@ mod tests {
         let mut cursor = std::io::Cursor::new(wire);
         let decoded = Capsule::read(&mut cursor).await.unwrap().unwrap();
         assert_eq!(capsule, decoded);
+    }
+
+    #[tokio::test]
+    async fn test_read_proxygen_close_webtransport_session() {
+        let mut wire = Vec::new();
+        VarInt::from_u64(0x190b4d45).unwrap().encode(&mut wire);
+        VarInt::from_u32(1).encode(&mut wire);
+        VarInt::from_u32(0).encode(&mut wire);
+
+        let mut cursor = std::io::Cursor::new(wire);
+        let decoded = Capsule::read(&mut cursor).await.unwrap().unwrap();
+        assert_eq!(
+            decoded,
+            Capsule::CloseWebTransportSession {
+                code: 0,
+                reason: String::new(),
+            }
+        );
     }
 
     #[tokio::test]
