@@ -52,6 +52,10 @@ impl Debug for Setting {
                 write!(f, "WEBTRANSPORT_MAX_SESSIONS_DEPRECATED")
             }
             Setting::WEBTRANSPORT_MAX_SESSIONS => write!(f, "WEBTRANSPORT_MAX_SESSIONS"),
+            Setting::WEBTRANSPORT_MAX_SESSIONS_DRAFT13 => {
+                write!(f, "WEBTRANSPORT_MAX_SESSIONS_DRAFT13")
+            }
+            Setting::WEBTRANSPORT_ENABLED => write!(f, "WEBTRANSPORT_ENABLED"),
             x if x.is_grease() => write!(f, "GREASE SETTING [{:x?}]", x.0.into_inner()),
             x => write!(f, "UNKNOWN_SETTING [{:x?}]", x.0.into_inner()),
         }
@@ -81,8 +85,14 @@ settings! {
     WEBTRANSPORT_ENABLE_DEPRECATED = 0x2b603742,
     WEBTRANSPORT_MAX_SESSIONS_DEPRECATED = 0x2b603743,
 
-    // New way to enable WebTransport
+    // Drafts 07 through 12
     WEBTRANSPORT_MAX_SESSIONS = 0xc671706a,
+
+    // Drafts 13 and 14
+    WEBTRANSPORT_MAX_SESSIONS_DRAFT13 = 0x14e9cd29,
+
+    // Draft 15 and later
+    WEBTRANSPORT_ENABLED = 0x2c7cf000,
 }
 
 #[derive(Error, Debug, Clone)]
@@ -235,6 +245,8 @@ impl Settings {
         self.insert(Setting::ENABLE_DATAGRAM, VarInt::from_u32(1));
         self.insert(Setting::ENABLE_DATAGRAM_DEPRECATED, VarInt::from_u32(1));
         self.insert(Setting::WEBTRANSPORT_MAX_SESSIONS, max);
+        self.insert(Setting::WEBTRANSPORT_MAX_SESSIONS_DRAFT13, max);
+        self.insert(Setting::WEBTRANSPORT_ENABLED, VarInt::from_u32(1));
 
         // TODO remove when 07 is in the wild
         self.insert(Setting::WEBTRANSPORT_MAX_SESSIONS_DEPRECATED, max);
@@ -263,9 +275,25 @@ impl Settings {
             return 0;
         }
 
-        // The deprecated (before draft-07) way of enabling WebTransport was to send two parameters.
-        // Both would send ENABLE=1 and the server would send MAX_SESSIONS=N to limit the sessions.
-        // Now both just send MAX_SESSIONS, and a non-zero value means WebTransport is enabled.
+        // Before draft-07, enabling WebTransport used separate ENABLE and
+        // MAX_SESSIONS settings. Drafts 07-14 used a non-zero MAX_SESSIONS
+        // setting (with a codepoint change at draft-13), while draft-15 and
+        // later use WT_ENABLED=1. Recognize all deployed families.
+
+        if let Some(enabled) = self.get(&Setting::WEBTRANSPORT_ENABLED) {
+            if enabled.into_inner() != 1 {
+                return 0;
+            }
+
+            return self
+                .get(&Setting::WEBTRANSPORT_MAX_SESSIONS_DRAFT13)
+                .map(|max| max.into_inner())
+                .unwrap_or(1);
+        }
+
+        if let Some(max) = self.get(&Setting::WEBTRANSPORT_MAX_SESSIONS_DRAFT13) {
+            return max.into_inner();
+        }
 
         if let Some(max) = self.get(&Setting::WEBTRANSPORT_MAX_SESSIONS) {
             return max.into_inner();
@@ -337,6 +365,42 @@ mod tests {
         let mut cursor = Cursor::new(wire);
         let decoded = Settings::read(&mut cursor).await.unwrap();
         assert_eq!(decoded.supports_webtransport(), 4);
+    }
+
+    #[test]
+    fn enable_webtransport_emits_current_and_draft13_settings() {
+        let mut settings = Settings::default();
+        settings.enable_webtransport(4);
+
+        assert_eq!(
+            settings.get(&Setting::WEBTRANSPORT_ENABLED),
+            Some(&VarInt::from_u32(1)),
+        );
+        assert_eq!(
+            settings.get(&Setting::WEBTRANSPORT_MAX_SESSIONS_DRAFT13),
+            Some(&VarInt::from_u32(4)),
+        );
+    }
+
+    #[test]
+    fn supports_quic_go_wt_enabled_setting() {
+        let mut settings = Settings::default();
+        settings.insert(Setting::ENABLE_DATAGRAM, VarInt::from_u32(1));
+        settings.insert(Setting::WEBTRANSPORT_ENABLED, VarInt::from_u32(1));
+
+        assert_eq!(settings.supports_webtransport(), 1);
+    }
+
+    #[test]
+    fn supports_xquic_draft13_max_sessions_setting() {
+        let mut settings = Settings::default();
+        settings.insert(Setting::ENABLE_DATAGRAM, VarInt::from_u32(1));
+        settings.insert(
+            Setting::WEBTRANSPORT_MAX_SESSIONS_DRAFT13,
+            VarInt::from_u32(4),
+        );
+
+        assert_eq!(settings.supports_webtransport(), 4);
     }
 
     #[tokio::test]
