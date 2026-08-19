@@ -49,6 +49,10 @@ pub(super) struct SendState {
     // received
     stop: Option<u64>,
 
+    // quiche discarded the stream before we asked it anything, so the peer stopped us
+    // but the code is gone. Terminal exactly like `stop`, with nothing to report.
+    gone: bool,
+
     // pending SET_PRIORITY, higher is sent first
     priority: Option<u8>,
 
@@ -66,6 +70,7 @@ impl SendState {
             fin: false,
             reset: None,
             stop: None,
+            gone: false,
             // Pin every stream to the default rather than inheriting quiche's, so that a
             // stream explicitly assigned a low priority can't be outranked by an untouched one.
             priority: Some(DEFAULT_PRIORITY),
@@ -84,7 +89,7 @@ impl SendState {
             return Poll::Ready(Err(StreamError::Reset(reset)));
         } else if let Some(stop) = self.stop {
             return Poll::Ready(Err(StreamError::Stop(stop)));
-        } else if self.fin {
+        } else if self.gone || self.fin {
             return Poll::Ready(Err(StreamError::Closed));
         }
 
@@ -111,6 +116,8 @@ impl SendState {
             return Poll::Ready(Err(StreamError::Reset(reset)));
         } else if let Some(stop) = self.stop {
             return Poll::Ready(Err(StreamError::Stop(stop)));
+        } else if self.gone {
+            return Poll::Ready(Err(StreamError::Closed));
         } else if self.closed {
             // self.closed means we sent the FIN already
             // TODO wait until the peer has acknowledged the fin
@@ -127,6 +134,10 @@ impl SendState {
             return Poll::Ready(Err(StreamError::Reset(reset)));
         } else if let Some(stop) = self.stop {
             return Poll::Ready(Err(StreamError::Stop(stop)));
+        } else if self.gone {
+            // The queue was discarded rather than sent, so reporting a successful
+            // flush here would tell the application its bytes reached the peer.
+            return Poll::Ready(Err(StreamError::Closed));
         } else if self.queued.is_empty() {
             return Poll::Ready(Ok(()));
         }
@@ -136,16 +147,50 @@ impl SendState {
         Poll::Pending
     }
 
+    /// Close this stream in response to a quiche error, or propagate a genuine
+    /// connection error.
+    ///
+    /// quiche reports the end of an individual stream through errors on otherwise
+    /// ordinary calls: `StreamStopped` once the peer has sent STOP_SENDING, and
+    /// `Done` or `InvalidStreamState` once quiche has reset the stream and collected
+    /// its state. All three mean this stream is over; none of them mean the
+    /// connection is, and promoting one would tear down every other stream on the
+    /// session.
+    #[must_use = "wake the driver"]
+    fn closed_by(&mut self, err: quiche::Error) -> quiche::Result<Option<Waker>> {
+        match err {
+            quiche::Error::StreamStopped(code) => {
+                tracing::trace!(stream_id = ?self.id, code, "received STOP_SENDING");
+                self.stop = Some(code);
+            }
+            quiche::Error::Done | quiche::Error::InvalidStreamState(_) => {
+                tracing::trace!(stream_id = ?self.id, "stream already collected by quiche");
+                // Only a peer STOP_SENDING gets a live stream collected, so this is a
+                // stop whose code quiche has already thrown away. It is not a `fin`:
+                // the application's bytes never left, and saying otherwise would report
+                // a successful flush for data the peer refused.
+                self.gone = true;
+            }
+            e => return Err(e),
+        }
+
+        // The driver drops this state as soon as it sees `closed`, so nothing here will
+        // ever be flushed again: leaving bytes queued would park a flush forever, and
+        // leaving capacity behind would let writes keep accumulating into a queue that
+        // no longer reaches the peer.
+        self.queued.clear();
+        self.capacity = 0;
+        self.closed = true;
+
+        Ok(self.blocked.take())
+    }
+
     #[must_use = "wake the driver"]
     pub fn flush(&mut self, qconn: &mut QuicheConnection) -> quiche::Result<Option<Waker>> {
         if let Some(code) = self.reset {
             tracing::trace!(stream_id = ?self.id, code, "sending RESET_STREAM");
-            // Resetting a single stream must never tear down the whole connection.
-            // quiche returns Done / InvalidStreamState when the stream is already
-            // finished or gone, which is a benign no-op here, not a fatal error.
-            match qconn.stream_shutdown(self.id.into(), quiche::Shutdown::Write, code) {
-                Ok(()) | Err(quiche::Error::Done) | Err(quiche::Error::InvalidStreamState(_)) => {}
-                Err(e) => return Err(e),
+            if let Err(e) = qconn.stream_shutdown(self.id.into(), quiche::Shutdown::Write, code) {
+                return self.closed_by(e);
             }
             self.closed = true;
             return Ok(self.blocked.take());
@@ -163,15 +208,11 @@ impl SendState {
         while let Some(mut chunk) = self.queued.pop_front() {
             let n = match qconn.stream_send(self.id.into(), &chunk, false) {
                 Ok(n) => n,
+                // Out of connection-level capacity, so retry once writable again.
+                // The same error also covers a collected stream, which the
+                // `stream_writable` registration below reports as gone.
                 Err(quiche::Error::Done) => 0,
-                Err(quiche::Error::StreamStopped(code)) => {
-                    tracing::trace!(stream_id = ?self.id, code, "received STOP_SENDING");
-
-                    self.stop = Some(code);
-                    self.closed = true;
-                    return Ok(self.blocked.take());
-                }
-                Err(e) => return Err(e),
+                Err(e) => return self.closed_by(e),
             };
 
             tracing::trace!(
@@ -187,7 +228,9 @@ impl SendState {
                 self.queued.push_front(remaining);
 
                 // Register a `stream_writable_next` callback when at least one byte is ready to send.
-                qconn.stream_writable(self.id.into(), 1)?;
+                if let Err(e) = qconn.stream_writable(self.id.into(), 1) {
+                    return self.closed_by(e);
+                }
 
                 break;
             }
@@ -195,7 +238,9 @@ impl SendState {
 
         if self.queued.is_empty() && self.fin {
             tracing::trace!(stream_id = ?self.id, "sending FIN");
-            qconn.stream_send(self.id.into(), &[], true)?;
+            if let Err(e) = qconn.stream_send(self.id.into(), &[], true) {
+                return self.closed_by(e);
+            }
 
             self.closed = true;
             return Ok(self.blocked.take());
@@ -203,14 +248,7 @@ impl SendState {
 
         self.capacity = match qconn.stream_capacity(self.id.into()) {
             Ok(capacity) => capacity,
-            Err(quiche::Error::StreamStopped(code)) => {
-                tracing::trace!(stream_id = ?self.id, code, "received STOP_SENDING");
-
-                self.stop = Some(code);
-                self.closed = true;
-                return Ok(self.blocked.take());
-            }
-            Err(e) => return Err(e),
+            Err(e) => return self.closed_by(e),
         };
 
         // A flush waiter can make progress as soon as the internal queue has
@@ -228,6 +266,8 @@ impl SendState {
             Err(StreamError::Reset(reset))
         } else if let Some(stop) = self.stop {
             Err(StreamError::Stop(stop))
+        } else if self.gone {
+            Err(StreamError::Closed)
         } else {
             Ok(self.fin)
         }
@@ -278,6 +318,23 @@ impl SendStream {
         self.id
     }
 
+    /// Tell the driver this stream has work to flush.
+    ///
+    /// Skipped once the state is closed: the driver retires a stream as soon as it
+    /// observes that, so a notification afterwards names a stream it no longer
+    /// tracks and is reported as a spurious wakeup.
+    fn notify(&self) {
+        // Take the two locks in sequence, never both at once.
+        let closed = self.state.lock().is_closed();
+        if closed {
+            return;
+        }
+
+        if let Some(waker) = self.driver.lock().send(self.id) {
+            waker.wake();
+        }
+    }
+
     /// Write some data to the stream, returning the size written.
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, StreamError> {
         let mut buf = io::Cursor::new(buf);
@@ -299,12 +356,12 @@ impl SendStream {
         waiter: &Waiter,
         buf: &mut B,
     ) -> Poll<Result<usize, StreamError>> {
-        if let Poll::Ready(res) = self.state.lock().poll_write_buf(waiter, buf) {
+        // Bind before notifying: on edition 2021 the guard from an `if let` scrutinee
+        // lives for the whole block, and `notify` takes the same lock.
+        let polled = self.state.lock().poll_write_buf(waiter, buf);
+        if let Poll::Ready(res) = polled {
             // Tell the driver that the stream has data to send.
-            let waker = self.driver.lock().send(self.id);
-            if let Some(waker) = waker {
-                waker.wake();
-            }
+            self.notify();
 
             return Poll::Ready(res);
         }
@@ -352,17 +409,14 @@ impl SendStream {
                 return Err(StreamError::Reset(reset));
             } else if let Some(stop) = state.stop {
                 return Err(StreamError::Stop(stop));
-            } else if state.fin {
+            } else if state.gone || state.fin {
                 return Err(StreamError::Closed);
             }
 
             state.fin = true;
         }
 
-        let waker = self.driver.lock().send(self.id);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
+        self.notify();
 
         Ok(())
     }
@@ -378,10 +432,7 @@ impl SendStream {
     pub fn reset(&mut self, code: u64) {
         self.state.lock().reset = Some(code);
 
-        let waker = self.driver.lock().send(self.id);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
+        self.notify();
     }
 
     /// Returns true if the stream is closed by either side.
@@ -440,10 +491,7 @@ impl SendStream {
     pub fn set_priority(&mut self, priority: u8) {
         self.state.lock().priority = Some(priority);
 
-        let waker = self.driver.lock().send(self.id);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
+        self.notify();
     }
 }
 
@@ -451,15 +499,12 @@ impl Drop for SendStream {
     fn drop(&mut self) {
         let mut state = self.state.lock();
 
-        if !state.fin && state.reset.is_none() && state.stop.is_none() {
+        if !state.fin && !state.gone && state.reset.is_none() && state.stop.is_none() {
             // Reset the stream if we're dropped without calling finish.
             state.reset = Some(DROP_CODE);
             drop(state);
 
-            let waker = self.driver.lock().send(self.id);
-            if let Some(waker) = waker {
-                waker.wake();
-            }
+            self.notify();
         }
     }
 }
