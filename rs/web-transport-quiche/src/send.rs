@@ -4,7 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 use tokio::io::AsyncWrite;
 
 use crate::{ez, StreamError};
@@ -108,6 +108,25 @@ impl web_transport_trait::SendStream for SendStream {
 
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         self.write(buf).await
+    }
+
+    /// Writes the **whole** buffer, like `web-transport-quinn`/`-s2n` do.
+    ///
+    /// The trait's default `write_buf` issues a single `write()` and advances by however
+    /// much that returned. `write()` here is capped by the stream's current QUIC send
+    /// capacity (`quiche::Connection::stream_capacity`, itself bounded by the congestion
+    /// window), so the default would silently discard the tail of every buffer larger than
+    /// the instantaneous capacity - and `write_chunk`, whose default is one `write_buf`,
+    /// inherited the same truncation while still returning `Ok(())`.
+    async fn write_buf<B: Buf + Send>(&mut self, buf: &mut B) -> Result<usize, Self::Error> {
+        let size = buf.remaining();
+        self.write_buf_all(buf).await?;
+        Ok(size)
+    }
+
+    async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), Self::Error> {
+        let mut chunk = chunk;
+        self.write_buf_all(&mut chunk).await
     }
 
     fn set_priority(&mut self, order: u8) {
