@@ -9,11 +9,6 @@ use tokio::io::AsyncWrite;
 
 use crate::{ez, StreamError};
 
-// "send" in ascii; if you see this then call finish().await or close(code)
-// hex: 0x73656E64, or 0x52E51B4DCE20 as an HTTP error code
-// decimal: 1685221232, or 91143959072288 as an HTTP error code
-const DROP_CODE: u64 = web_transport_proto::error_to_http3(0x73656E64);
-
 /// A stream that can be used to send bytes.
 ///
 /// This wrapper is mainly needed for error codes.
@@ -75,10 +70,11 @@ impl SendStream {
 
 impl Drop for SendStream {
     fn drop(&mut self) {
-        // Reset the stream if we dropped without calling `close` or `reset`
+        // Send a FIN instead of a RESET_STREAM, matching the other backends.
+        // A reset here would discard the WebTransport header written by `open_uni`/`open_bi`,
+        // hiding the stream from the peer entirely instead of surfacing an error.
         if !self.inner.is_finished().unwrap_or(true) {
-            tracing::warn!("stream dropped without `close` or `reset`");
-            self.inner.reset(DROP_CODE)
+            let _ = self.inner.finish();
         }
     }
 }
