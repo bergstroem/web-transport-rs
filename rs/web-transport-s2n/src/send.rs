@@ -1,6 +1,6 @@
 use std::sync::{Arc, OnceLock};
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 
 use crate::{app_error, SessionError, WriteError};
 
@@ -101,15 +101,16 @@ impl web_transport_trait::SendStream for SendStream {
         Self::write(self, buf).await
     }
 
-    async fn write_buf<B: Buf + Send>(&mut self, buf: &mut B) -> Result<usize, Self::Error> {
-        // Avoid a copy when the Buf is already Bytes.
-        let size = buf.chunk().len();
-        let chunk = buf.copy_to_bytes(size);
-        self.write_chunk(chunk).await?;
-        Ok(size)
-    }
+    // `write_buf` is deliberately left to the trait's default, which writes out of
+    // `buf.chunk()` and advances only by what s2n-quic accepted. Overriding it to
+    // `copy_to_bytes` up front and then await the zero-copy `write_chunk` would be
+    // faster but loses data: `write_chunk` is not cancel safe, so a caller that
+    // drops the future strands the chunk - gone from `buf` but never sent, a silent
+    // hole in the stream.
 
     async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), Self::Error> {
+        // Sound to keep zero-copy here: the caller hands over ownership, so there is
+        // no buffer position to get out of sync with a cancelled write.
         Self::write_chunk(self, chunk).await
     }
 
