@@ -35,12 +35,16 @@ pub use session::*;
 // Internal
 mod connect;
 mod settings;
+mod stats;
 
 use connect::*;
 use settings::*;
 
 // Required to access the wrapped proto ConnectError.
 pub use connect::ConnectError;
+
+// Connection-level statistics, returned by `Session::stats`.
+pub use stats::SessionStats;
 
 /// The HTTP/3 ALPN is required when negotiating a QUIC connection.
 pub const ALPN: &str = "h3";

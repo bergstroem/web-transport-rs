@@ -4,6 +4,7 @@ use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use s2n_quic::connection::{Handle, StreamAcceptor};
 
+use crate::stats::RecoverySubscriber;
 use crate::tls::ServerTlsProvider;
 use crate::{
     crypto, datagram_endpoint,
@@ -58,6 +59,9 @@ impl ServerBuilder {
             .with_io(self.addr)
             .map_err(|e| ServerError::Build(e.to_string()))?
             .with_datagram(datagram_endpoint())
+            .map_err(|e| ServerError::Build(e.to_string()))?
+            // Backs `Session::stats()`; see `stats::RecoverySubscriber`.
+            .with_event(RecoverySubscriber)
             .map_err(|e| ServerError::Build(e.to_string()))?
             .start()
             .map_err(|e| ServerError::Build(e.to_string()))?;

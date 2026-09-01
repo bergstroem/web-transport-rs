@@ -18,8 +18,9 @@ use tokio::sync::watch;
 use crate::{
     app_error,
     proto::{ConnectRequest, ConnectResponse, Frame, StreamUni, VarInt},
-    ClientError, Connected, RecvStream, SendDatagramError, SendStream, SessionError, Settings,
-    WebTransportError,
+    stats::RecoveryContext,
+    ClientError, Connected, RecvStream, SendDatagramError, SendStream, SessionError, SessionStats,
+    Settings, WebTransportError,
 };
 
 /// A conservative datagram payload limit, using the QUIC minimum guaranteed datagram
@@ -293,8 +294,25 @@ impl Session {
     ///
     /// Returns `None` when the endpoint has no subscriber whose `ConnectionContext` is `C`
     /// (including the default, event-less endpoint) or when the connection has gone away.
+    ///
+    /// [`Session::stats`] uses this internally, against a subscriber this crate registers
+    /// on every endpoint it builds. There is no way yet for an application to register its
+    /// own alongside it; a future passthrough for that must compose the two subscribers via
+    /// s2n-quic's tuple mechanism (`.with_event((RecoverySubscriber, app_subscriber))`)
+    /// rather than replacing this one, since `with_event` otherwise overwrites the provider.
     pub fn query_event_context<C: 'static, R>(&self, query: impl FnOnce(&C) -> R) -> Option<R> {
         self.handle.query_event_context(query).ok()
+    }
+
+    /// Return connection-level statistics sourced from s2n-quic's recovery-metrics event.
+    ///
+    /// See [`SessionStats`] for what is (and isn't) tracked.
+    pub fn stats(&self) -> SessionStats {
+        let recovery = self.query_event_context::<RecoveryContext, _>(|ctx| *ctx);
+        SessionStats {
+            rtt: recovery.and_then(|ctx| ctx.smoothed_rtt),
+            congestion_window: recovery.and_then(|ctx| ctx.congestion_window),
+        }
     }
 
     /// Returns the address of the peer on the other end of this session.
@@ -484,6 +502,11 @@ impl web_transport_trait::Session for Session {
 
     fn protocol(&self) -> Option<&str> {
         self.response.protocol.as_deref()
+    }
+
+    #[allow(refining_impl_trait)]
+    fn stats(&self) -> SessionStats {
+        Self::stats(self)
     }
 }
 

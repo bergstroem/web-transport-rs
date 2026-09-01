@@ -110,6 +110,30 @@ async fn datagrams() {
 }
 
 #[tokio::test]
+async fn stats_report_rtt_and_send_rate() {
+    use web_transport_s2n::generic::Stats;
+
+    let (client, _server, _guard) = connect().await;
+
+    // Recovery metrics land asynchronously (pushed by the connection's background
+    // task), so poll until the first one arrives rather than assuming it's ready
+    // immediately after the handshake completes.
+    let rtt = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(rtt) = client.stats().rtt() {
+                return rtt;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("recovery metrics timeout");
+
+    assert!(rtt > Duration::ZERO);
+    assert!(client.stats().estimated_send_rate().unwrap() > 0);
+}
+
+#[tokio::test]
 async fn graceful_close() {
     let (client, server, _guard) = connect().await;
 

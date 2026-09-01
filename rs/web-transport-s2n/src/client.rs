@@ -6,6 +6,7 @@ use s2n_quic::client::Connect;
 use tokio::net::lookup_host;
 use url::Host;
 
+use crate::stats::RecoverySubscriber;
 use crate::tls::ClientTlsProvider;
 use crate::{crypto, datagram_endpoint, proto::ConnectRequest, ClientError, Session, ALPN};
 
@@ -99,6 +100,9 @@ impl ClientBuilder {
             .with_io("0.0.0.0:0")
             .map_err(|e| ClientError::Build(e.to_string()))?
             .with_datagram(datagram_endpoint())
+            .map_err(|e| ClientError::Build(e.to_string()))?
+            // Backs `Session::stats()`; see `stats::RecoverySubscriber`.
+            .with_event(RecoverySubscriber)
             .map_err(|e| ClientError::Build(e.to_string()))?
             .start()
             .map_err(|e| ClientError::Build(e.to_string()))?;
